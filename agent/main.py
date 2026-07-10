@@ -9,6 +9,7 @@ Exits:  0 on success, 1 on failure
 import json
 import logging
 import os
+import re
 import sys
 import time
 
@@ -19,8 +20,7 @@ try:
 except ImportError:
     pass  # python-dotenv not installed — running in Docker, env already set
 
-from agent.classifier import classify
-from agent.router import route
+from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -38,7 +38,167 @@ logger = logging.getLogger(__name__)
 INPUT_PATH = os.environ.get("INPUT_PATH", "/input/tasks.json")
 OUTPUT_PATH = os.environ.get("OUTPUT_PATH", "/output/results.json")
 
+# ---------------------------------------------------------------------------
+# Universal system prompt — lets the model follow the task's own instructions
+# ---------------------------------------------------------------------------
+SYSTEM_PROMPT = (
+    "You are a highly capable AI assistant. "
+    "Follow the user's instructions precisely and completely. "
+    "Output ONLY what is asked for — no preamble, no thinking steps, "
+    "no meta-commentary, no restating the question. "
+    "If the task asks for a specific format, use that exact format. "
+    "Be concise and accurate."
+)
 
+MAX_TOKENS = 1024
+
+
+# ---------------------------------------------------------------------------
+# Fireworks client
+# ---------------------------------------------------------------------------
+_client: OpenAI | None = None
+
+
+def _get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        api_key = os.environ["FIREWORKS_API_KEY"]
+        base_url = os.environ["FIREWORKS_BASE_URL"]
+        _client = OpenAI(api_key=api_key, base_url=base_url)
+    return _client
+
+
+def get_allowed_models() -> list[str]:
+    raw = os.environ.get("ALLOWED_MODELS", "")
+    return [m.strip() for m in raw.split(",") if m.strip()]
+
+
+def _rank_models_best_first(models: list[str]) -> list[str]:
+    """Rank models: direct-answer models first, thinking models last."""
+    def score(name: str) -> int:
+        n = name.lower()
+        # gpt-oss-120b — large, direct answers
+        if "gpt-oss" in n or "120" in n:
+            return 10
+        # deepseek-v4-pro — large, direct answers
+        if "deepseek" in n:
+            return 20
+        # kimi/glm — thinking models, deprioritise
+        if "kimi" in n or "glm" in n:
+            return 100
+        return 50
+    return sorted(models, key=score)
+
+
+def _clean_output(content: str) -> str:
+    """Strip thinking model artifacts from output."""
+    # Remove <think>...</think> blocks
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+
+    lines = content.split("\n")
+    # Detect thinking preamble
+    thinking_markers = [
+        r"^\s*The user wants",
+        r"^\s*I need to",
+        r"^\s*Let me (analyze|check|think|reason|break|consider|look|start|figure|verify|re-read)",
+        r"^\s*\d+\.\s+\*\*Analyze",
+        r"^\s*\d+\.\s+\*\*Retrieve",
+        r"^\s*\d+\.\s+\*\*Calculate",
+        r"^\s*\d+\.\s+\*\*Format",
+    ]
+    first_lines = "\n".join(lines[:5])
+    is_thinking = any(re.search(p, first_lines, re.IGNORECASE) for p in thinking_markers)
+
+    if not is_thinking:
+        return content.strip()
+
+    # Extract final answer block from thinking output.
+    # Strategy: Find content after the last "noise" section.
+    # Look for the final substantive output.
+
+    noise_patterns = [
+        re.compile(r"^\s*(The user|I need to|Let me|Wait,|Actually,|Hmm|OK|So,|Now,|This (could|should|is|means)|Or |Possible|That's )", re.IGNORECASE),
+        re.compile(r"^\s*\d+\.\s+\*\*"),   # numbered bold steps
+        re.compile(r"^\s*Step\s+\d+", re.IGNORECASE),
+    ]
+
+    # Walk backwards from the end to find the last block of non-noise content
+    # This is the actual answer the model intended to output
+    result_lines: list[str] = []
+    found_content = False
+
+    for line in reversed(lines):
+        stripped = line.strip()
+        if not stripped:
+            if found_content:
+                # Empty line while we have content — check if we've reached noise above
+                result_lines.append(line)
+            continue
+
+        is_noise = any(p.match(stripped) for p in noise_patterns)
+        if is_noise and found_content:
+            # We've hit the reasoning section — stop here
+            break
+
+        result_lines.append(line)
+        found_content = True
+
+    if result_lines:
+        result_lines.reverse()
+        # Strip leading/trailing empty lines
+        while result_lines and not result_lines[0].strip():
+            result_lines.pop(0)
+        while result_lines and not result_lines[-1].strip():
+            result_lines.pop()
+        if result_lines:
+            return "\n".join(result_lines).strip()
+
+    return content.strip()
+
+
+def call_fireworks(prompt: str) -> str:
+    """
+    Call the best available Fireworks model with the universal prompt.
+    Tries models in priority order, falls back on failure.
+    """
+    models = _rank_models_best_first(get_allowed_models())
+    if not models:
+        raise RuntimeError("ALLOWED_MODELS is empty or not set.")
+
+    client = _get_client()
+    last_exc: Exception | None = None
+
+    for model in models:
+        try:
+            logger.info("Calling Fireworks model: %s", model)
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=MAX_TOKENS,
+                temperature=0.0,
+            )
+            content = response.choices[0].message.content
+            if content is None:
+                raise ValueError(
+                    f"Model '{model}' returned null content "
+                    f"(finish_reason={response.choices[0].finish_reason})"
+                )
+            answer = _clean_output(content)
+            logger.info("Model %s answered successfully.", model)
+            return answer
+        except Exception as exc:
+            logger.warning("Model %s failed: %s — trying next.", model, exc)
+            last_exc = exc
+
+    raise RuntimeError(f"All Fireworks models failed. Last error: {last_exc}")
+
+
+# ---------------------------------------------------------------------------
+# Task processing
+# ---------------------------------------------------------------------------
 def load_tasks(path: str) -> list[dict]:
     logger.info("Loading tasks from %s", path)
     with open(path, "r", encoding="utf-8") as f:
@@ -60,13 +220,11 @@ def process_task(task: dict) -> dict:
     prompt = task["prompt"]
 
     logger.info("--- Processing task: %s ---", task_id)
-    category = classify(prompt)
-    logger.info("Classified '%s' as: %s", task_id, category)
 
     start = time.monotonic()
-    answer = route(category, prompt)
+    answer = call_fireworks(prompt)
     elapsed = time.monotonic() - start
-    logger.info("Task '%s' answered in %.1fs (category=%s).", task_id, elapsed, category)
+    logger.info("Task '%s' answered in %.1fs.", task_id, elapsed)
 
     return {"task_id": task_id, "answer": answer}
 
