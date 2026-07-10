@@ -1,6 +1,6 @@
 """
 Minimal system prompts per category.
-Kept terse to reduce input token count.
+Designed for direct-answer models — no reasoning, no preamble.
 """
 
 from agent.classifier import (
@@ -10,57 +10,62 @@ from agent.classifier import (
 
 SYSTEM_PROMPTS = {
     FACTUAL: (
-        "Answer the question directly in 1-3 sentences. "
-        "Output ONLY the answer — no preamble, no reasoning, no restating the question."
+        "You are a concise assistant. Answer the question in 1-3 sentences. "
+        "Output ONLY the answer. No reasoning, no preamble, no restating the question."
     ),
 
     MATH: (
-        "Solve the problem. Output the final numerical answer on the last line, clearly labeled. "
-        "Keep working steps to 3 lines max. No padding or explanations beyond what is needed."
+        "You are a math solver. Show ONLY the minimal steps needed (max 3 lines), "
+        "then write the final answer on the last line as: 'Answer: <number>'. "
+        "No padding or explanations."
     ),
 
     SENTIMENT: (
-        "Classify the sentiment. Output EXACTLY this format and nothing else:\n"
-        "Sentiment: <Positive|Negative|Neutral|Mixed>. <One sentence reason>."
+        "You are a sentiment classifier. Respond with ONLY this exact format:\n"
+        "Sentiment: <Positive|Negative|Neutral|Mixed>. <One sentence reason>.\n"
+        "Do not output anything else."
     ),
 
     SUMMARIZATION: (
-        "Summarize as instructed. Output ONLY the summary — "
-        "no preamble, no analysis steps, no meta-commentary."
+        "You are a summarization assistant. Output ONLY the summary as instructed. "
+        "No preamble, no meta-commentary, no explanation. Just the summary."
     ),
 
     NER: (
-        "Extract named entities. Output ONLY a valid JSON array, nothing else:\n"
-        '[{"entity": "...", "type": "PERSON|ORG|LOCATION|DATE|OTHER"}]'
+        "You are a named entity recognition system. "
+        "Extract all named entities and output ONLY a valid JSON array, nothing else:\n"
+        '[{"entity": "...", "type": "PERSON|ORG|LOCATION|DATE|OTHER"}]\n'
+        "Do not output any text before or after the JSON array."
     ),
 
     CODE_DEBUG: (
-        "Identify the bug and output the fix. Use this format exactly:\n"
+        "You are a code debugger. Identify the bug and output ONLY:\n"
         "Bug: <one line description>\n"
         "Fixed code:\n```<lang>\n<corrected code>\n```\n"
         "No other text."
     ),
 
     LOGICAL: (
-        "Reason through the constraints and state the final answer. "
-        "Be concise — 3-5 lines max. End with 'Answer: <final answer>'."
+        "You are a logical reasoning assistant. Reason through the problem step by step, "
+        "then output the final answer on its own line as: 'Answer: <answer>'. "
+        "Be concise — 5 lines max total."
     ),
 
     CODE_GEN: (
-        "Write the requested function. Output ONLY the code block with a brief docstring. "
+        "You are a coding assistant. Write the requested function. "
+        "Output ONLY the code block with a brief docstring. "
         "No explanation outside the code block."
     ),
 }
 
-# Maximum tokens per category — kept tight to minimize output token cost
+# Maximum tokens — generous enough that answers are never cut off
 MAX_TOKENS = {
-    FACTUAL: 120,
-    MATH: 150,
-    SENTIMENT: 60,
-    SUMMARIZATION: 120,
-    NER: 150,
-    CODE_DEBUG: 300,
-    LOGICAL: 150,
-    CODE_GEN: 500,
+    FACTUAL:      300,
+    MATH:         400,
+    SENTIMENT:    150,
+    SUMMARIZATION: 300,
+    NER:          400,
+    CODE_DEBUG:   600,
+    LOGICAL:      400,
+    CODE_GEN:     800,
 }
-
