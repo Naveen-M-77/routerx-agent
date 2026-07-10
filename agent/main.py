@@ -1,6 +1,10 @@
 """
 Entry point for the AMD Hackathon Track 1 AI Agent.
 
+Strategy: LOCAL-FIRST for zero token cost.
+  1. All tasks go to local Ollama model (qwen2.5:7b) — 0 Fireworks tokens
+  2. Only falls back to Fireworks API if local model is unavailable or fails
+
 Reads:  /input/tasks.json  (or INPUT_PATH env var)
 Writes: /output/results.json (or OUTPUT_PATH env var)
 Exits:  0 on success, 1 on failure
@@ -16,10 +20,11 @@ import time
 # ── Load .env for local development (no-op in Docker where env is injected) ──
 try:
     from dotenv import load_dotenv
-    load_dotenv(override=False)   # don't override vars already in the environment
+    load_dotenv(override=False)
 except ImportError:
-    pass  # python-dotenv not installed — running in Docker, env already set
+    pass
 
+import requests
 from openai import OpenAI
 
 # ---------------------------------------------------------------------------
@@ -33,13 +38,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Paths — defaults match Docker mount points; override via env / .env
+# Paths
 # ---------------------------------------------------------------------------
 INPUT_PATH = os.environ.get("INPUT_PATH", "/input/tasks.json")
 OUTPUT_PATH = os.environ.get("OUTPUT_PATH", "/output/results.json")
 
 # ---------------------------------------------------------------------------
-# Universal system prompt — lets the model follow the task's own instructions
+# Local model config (Ollama)
+# ---------------------------------------------------------------------------
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "qwen2.5:7b")
+LOCAL_TIMEOUT = int(os.environ.get("LOCAL_TIMEOUT_SEC", "120"))
+
+# ---------------------------------------------------------------------------
+# Universal system prompt
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = (
     "You are a highly capable AI assistant. "
@@ -54,36 +66,95 @@ MAX_TOKENS = 1024
 
 
 # ---------------------------------------------------------------------------
-# Fireworks client
+# Local Ollama inference
 # ---------------------------------------------------------------------------
-_client: OpenAI | None = None
+def _ollama_ready() -> bool:
+    """Check if Ollama server is running."""
+    try:
+        r = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=3)
+        return r.status_code == 200
+    except Exception:
+        return False
 
 
-def _get_client() -> OpenAI:
-    global _client
-    if _client is None:
-        api_key = os.environ["FIREWORKS_API_KEY"]
-        base_url = os.environ["FIREWORKS_BASE_URL"]
-        _client = OpenAI(api_key=api_key, base_url=base_url)
-    return _client
+def _wait_for_ollama(max_wait: int = 60) -> bool:
+    """Poll until Ollama server is ready."""
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        if _ollama_ready():
+            return True
+        time.sleep(2)
+    return False
 
 
-def get_allowed_models() -> list[str]:
-    raw = os.environ.get("ALLOWED_MODELS", "")
-    return [m.strip() for m in raw.split(",") if m.strip()]
+def call_local(prompt: str) -> str | None:
+    """
+    Call local Ollama model. Returns answer or None on failure.
+    Zero Fireworks token cost.
+    """
+    if not _ollama_ready():
+        logger.info("Ollama not available — skipping local model.")
+        return None
+
+    payload = {
+        "model": LOCAL_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+        "options": {
+            "num_predict": MAX_TOKENS,
+            "temperature": 0.0,
+        },
+    }
+
+    try:
+        resp = requests.post(
+            f"{OLLAMA_HOST}/api/chat",
+            json=payload,
+            timeout=LOCAL_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        content = data["message"]["content"].strip()
+        if content:
+            return content
+        logger.warning("Local model returned empty content.")
+        return None
+    except requests.Timeout:
+        logger.warning("Local model timed out after %ss.", LOCAL_TIMEOUT)
+        return None
+    except Exception as exc:
+        logger.warning("Local model error: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Fireworks API fallback
+# ---------------------------------------------------------------------------
+_fw_client: OpenAI | None = None
+
+
+def _get_fw_client() -> OpenAI:
+    global _fw_client
+    if _fw_client is None:
+        api_key = os.environ.get("FIREWORKS_API_KEY", "")
+        base_url = os.environ.get("FIREWORKS_BASE_URL", "")
+        if not api_key or not base_url:
+            raise RuntimeError("Fireworks API not configured.")
+        _fw_client = OpenAI(api_key=api_key, base_url=base_url)
+    return _fw_client
 
 
 def _rank_models_best_first(models: list[str]) -> list[str]:
     """Rank models: direct-answer models first, thinking models last."""
     def score(name: str) -> int:
         n = name.lower()
-        # gpt-oss-120b — large, direct answers
         if "gpt-oss" in n or "120" in n:
             return 10
-        # deepseek-v4-pro — large, direct answers
         if "deepseek" in n:
             return 20
-        # kimi/glm — thinking models, deprioritise
         if "kimi" in n or "glm" in n:
             return 100
         return 50
@@ -92,19 +163,13 @@ def _rank_models_best_first(models: list[str]) -> list[str]:
 
 def _clean_output(content: str) -> str:
     """Strip thinking model artifacts from output."""
-    # Remove <think>...</think> blocks
     content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
 
     lines = content.split("\n")
-    # Detect thinking preamble
     thinking_markers = [
         r"^\s*The user wants",
         r"^\s*I need to",
-        r"^\s*Let me (analyze|check|think|reason|break|consider|look|start|figure|verify|re-read)",
-        r"^\s*\d+\.\s+\*\*Analyze",
-        r"^\s*\d+\.\s+\*\*Retrieve",
-        r"^\s*\d+\.\s+\*\*Calculate",
-        r"^\s*\d+\.\s+\*\*Format",
+        r"^\s*Let me (analyze|check|think|reason|break|consider|look|start|figure|verify)",
     ]
     first_lines = "\n".join(lines[:5])
     is_thinking = any(re.search(p, first_lines, re.IGNORECASE) for p in thinking_markers)
@@ -112,18 +177,12 @@ def _clean_output(content: str) -> str:
     if not is_thinking:
         return content.strip()
 
-    # Extract final answer block from thinking output.
-    # Strategy: Find content after the last "noise" section.
-    # Look for the final substantive output.
-
     noise_patterns = [
-        re.compile(r"^\s*(The user|I need to|Let me|Wait,|Actually,|Hmm|OK|So,|Now,|This (could|should|is|means)|Or |Possible|That's )", re.IGNORECASE),
-        re.compile(r"^\s*\d+\.\s+\*\*"),   # numbered bold steps
+        re.compile(r"^\s*(The user|I need to|Let me|Wait,|Actually,|Hmm|OK|So,|Now,|This (could|should|is|means)|Or |Possible)", re.IGNORECASE),
+        re.compile(r"^\s*\d+\.\s+\*\*"),
         re.compile(r"^\s*Step\s+\d+", re.IGNORECASE),
     ]
 
-    # Walk backwards from the end to find the last block of non-noise content
-    # This is the actual answer the model intended to output
     result_lines: list[str] = []
     found_content = False
 
@@ -131,21 +190,16 @@ def _clean_output(content: str) -> str:
         stripped = line.strip()
         if not stripped:
             if found_content:
-                # Empty line while we have content — check if we've reached noise above
                 result_lines.append(line)
             continue
-
         is_noise = any(p.match(stripped) for p in noise_patterns)
         if is_noise and found_content:
-            # We've hit the reasoning section — stop here
             break
-
         result_lines.append(line)
         found_content = True
 
     if result_lines:
         result_lines.reverse()
-        # Strip leading/trailing empty lines
         while result_lines and not result_lines[0].strip():
             result_lines.pop(0)
         while result_lines and not result_lines[-1].strip():
@@ -157,15 +211,13 @@ def _clean_output(content: str) -> str:
 
 
 def call_fireworks(prompt: str) -> str:
-    """
-    Call the best available Fireworks model with the universal prompt.
-    Tries models in priority order, falls back on failure.
-    """
-    models = _rank_models_best_first(get_allowed_models())
+    """Fireworks API fallback — only used if local model fails."""
+    raw = os.environ.get("ALLOWED_MODELS", "")
+    models = _rank_models_best_first([m.strip() for m in raw.split(",") if m.strip()])
     if not models:
         raise RuntimeError("ALLOWED_MODELS is empty or not set.")
 
-    client = _get_client()
+    client = _get_fw_client()
     last_exc: Exception | None = None
 
     for model in models:
@@ -182,13 +234,8 @@ def call_fireworks(prompt: str) -> str:
             )
             content = response.choices[0].message.content
             if content is None:
-                raise ValueError(
-                    f"Model '{model}' returned null content "
-                    f"(finish_reason={response.choices[0].finish_reason})"
-                )
-            answer = _clean_output(content)
-            logger.info("Model %s answered successfully.", model)
-            return answer
+                raise ValueError(f"Model '{model}' returned null content")
+            return _clean_output(content)
         except Exception as exc:
             logger.warning("Model %s failed: %s — trying next.", model, exc)
             last_exc = exc
@@ -222,23 +269,29 @@ def process_task(task: dict) -> dict:
     logger.info("--- Processing task: %s ---", task_id)
 
     start = time.monotonic()
+
+    # Try local model first (zero Fireworks tokens)
+    answer = call_local(prompt)
+    if answer:
+        elapsed = time.monotonic() - start
+        logger.info("Task '%s' answered LOCALLY in %.1fs (0 tokens).", task_id, elapsed)
+        return {"task_id": task_id, "answer": answer}
+
+    # Fallback to Fireworks API
+    logger.info("Task '%s': falling back to Fireworks API.", task_id)
     answer = call_fireworks(prompt)
     elapsed = time.monotonic() - start
-    logger.info("Task '%s' answered in %.1fs.", task_id, elapsed)
+    logger.info("Task '%s' answered via Fireworks in %.1fs.", task_id, elapsed)
 
     return {"task_id": task_id, "answer": answer}
 
 
 def main() -> int:
-    # Validate required env vars early
-    missing = [v for v in ("FIREWORKS_API_KEY", "FIREWORKS_BASE_URL", "ALLOWED_MODELS")
-               if not os.environ.get(v)]
-    if missing:
-        logger.warning(
-            "Missing env vars: %s. Fireworks calls may fail. "
-            "For local testing, set these in your .env file.",
-            ", ".join(missing),
-        )
+    # Wait for Ollama if available
+    if _wait_for_ollama(max_wait=30):
+        logger.info("Ollama is ready — local-first mode enabled.")
+    else:
+        logger.warning("Ollama not available — will use Fireworks API only.")
 
     try:
         tasks = load_tasks(INPUT_PATH)
@@ -260,7 +313,6 @@ def main() -> int:
             task_id = task.get("task_id", "?")
             logger.error("Task '%s' failed: %s", task_id, exc, exc_info=True)
             failed.append(task_id)
-            # Still emit a placeholder so the output schema is valid
             results.append({"task_id": task_id, "answer": f"[ERROR: {exc}]"})
 
     try:

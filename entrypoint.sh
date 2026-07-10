@@ -2,7 +2,7 @@
 # ─────────────────────────────────────────────────────────────
 # Entrypoint for AMD Hackathon Track 1 Agent
 # 1. Starts Ollama server in background
-# 2. Pulls the local model (or uses cached layers)
+# 2. Waits for it to be ready (model already baked into image)
 # 3. Runs the Python agent
 # ─────────────────────────────────────────────────────────────
 set -euo pipefail
@@ -21,10 +21,9 @@ for i in $(seq 1 15); do
     sleep 2
 done
 
-# Pull local model (fast if layers already cached in image)
-LOCAL_MODEL="${LOCAL_MODEL:-qwen2.5:1.5b}"
-echo "[entrypoint] Pulling model: ${LOCAL_MODEL}"
-ollama pull "${LOCAL_MODEL}" || echo "[entrypoint] WARNING: Failed to pull local model — will use Fireworks only."
+# Model is pre-baked in the image — no pull needed at runtime
+LOCAL_MODEL="${LOCAL_MODEL:-qwen2.5:7b}"
+echo "[entrypoint] Using pre-loaded model: ${LOCAL_MODEL}"
 
 echo "[entrypoint] Starting agent..."
 python -m agent.main

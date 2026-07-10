@@ -11,8 +11,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Install Ollama ────────────────────────────────────────────
-# Official install script — places binary at /usr/local/bin/ollama
 RUN curl -fsSL https://ollama.ai/install.sh | sh
+
+# ── Pre-pull model into image (zero-cost local inference) ─────
+# Start Ollama temporarily, pull the model, then stop.
+# This bakes the model weights into the Docker layer so there's
+# no network download at runtime (works in air-gapped eval).
+ENV LOCAL_MODEL=qwen2.5:7b
+RUN ollama serve & \
+    sleep 5 && \
+    ollama pull ${LOCAL_MODEL} && \
+    kill %1 || true
 
 # ── Python dependencies ───────────────────────────────────────
 WORKDIR /app
